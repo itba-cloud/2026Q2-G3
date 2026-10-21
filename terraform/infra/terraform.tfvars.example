@@ -1,0 +1,20 @@
+# Copiar como terraform.tfvars (está en .gitignore) y completar.
+region       = "us-east-1"
+project_name = "accesoseguro"
+environment  = "dev"
+
+# Versión de la imagen de la API que corre ECS (nunca latest).
+api_image_tag = "v1.1"
+
+# Vencimiento de permisos aprobados y no usados.
+permiso_vigencia_segundos         = 86400 # 24 horas desde la aprobación
+vencer_permisos_intervalo_minutos = 15    # frecuencia de la Lambda vencer-permisos
+
+# Mail que recibe las alarmas (vacío = sin suscripción).
+alarm_email = ""
+
+# RDS
+db_multi_az = true
+
+# Poner true solo si el Learner Lab deja crear trails.
+enable_cloudtrail = false
