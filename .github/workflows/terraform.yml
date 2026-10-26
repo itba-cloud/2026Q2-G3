@@ -1,0 +1,128 @@
+# Pipeline de Terraform: corre en cada pull request.
+#   1. fmt      -> el código está formateado
+#   2. init     -> descarga providers y módulos
+#   3. validate -> la sintaxis y las referencias son correctas
+#   4. plan     -> qué cambiaría en AWS (necesita credenciales del Learner Lab)
+name: terraform
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: accesoseguro-terraform
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  TF_VERSION: "1.10.5"
+  TF_IN_AUTOMATION: "true"
+  AWS_REGION: us-east-1
+
+jobs:
+  validate:
+    name: fmt + init + validate (${{ matrix.stack }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        stack: [bootstrap, infra]
+    defaults:
+      run:
+        working-directory: terraform/${{ matrix.stack }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: terraform fmt
+        run: terraform fmt -check -recursive -diff ../..
+
+      # -backend=false: para validar no hace falta el state ni credenciales.
+      - name: terraform init
+        run: terraform init -backend=false -input=false
+
+      - name: terraform validate
+        run: terraform validate -no-color
+
+  plan:
+    name: init + plan (infra)
+    needs: validate
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: terraform/infra
+    env:
+      # Credenciales del Learner Lab (AWS Details > AWS CLI). Vencen cada
+      # sesión: actualizarlas en Settings > Secrets antes de abrir el PR.
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
+      TF_STATE_BUCKET: ${{ secrets.TF_STATE_BUCKET }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Revisar credenciales
+        id: creds
+        run: |
+          if [ -z "$AWS_ACCESS_KEY_ID" ] || [ -z "$AWS_SECRET_ACCESS_KEY" ] || [ -z "$AWS_SESSION_TOKEN" ]; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Faltan credenciales AWS del repositorio receptor (no se comparten con forks): plan no ejecutado."
+          else
+            if [ -z "$TF_STATE_BUCKET" ]; then
+              account=$(aws sts get-caller-identity --query Account --output text)
+              echo "TF_STATE_BUCKET=accesoseguro-tfstate-${account}" >> "$GITHUB_ENV"
+            fi
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Armar backend.hcl
+        if: steps.creds.outputs.available == 'true'
+        run: |
+          cat > backend.hcl <<EOF
+          bucket       = "${TF_STATE_BUCKET}"
+          key          = "accesoseguro/dev/infra.tfstate"
+          region       = "${AWS_REGION}"
+          encrypt      = true
+          use_lockfile = true
+          EOF
+
+      - name: terraform init
+        if: steps.creds.outputs.available == 'true'
+        run: terraform init -input=false -backend-config=backend.hcl
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Empaquetar Layer de notificaciones
+        if: steps.creds.outputs.available == 'true'
+        run: python ../../scripts/build-notifications-layer.py
+
+      - name: terraform plan
+        if: steps.creds.outputs.available == 'true'
+        id: plan
+        run: |
+          set -euo pipefail
+          terraform plan -input=false -no-color -lock-timeout=120s -var="api_image_tag=${GITHUB_SHA}" -out=tfplan | tee plan.txt
+          terraform show -no-color tfplan > /dev/null
+
+      - name: Publicar el plan en el resumen
+        if: steps.creds.outputs.available == 'true'
+        run: |
+          {
+            echo "## terraform plan"
+            echo '```'
+            tail -c 60000 plan.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
